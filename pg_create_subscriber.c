@@ -85,10 +85,12 @@ static void wait_postmaster_shutdown(void);
 
 static char *validate_publication_names_input(char *publication_names);
 
-static void remove_unwanted_data(PGconn *conn);
-static void initialize_replication_origin(PGconn *conn, char *origin_name, char *remote_lsn);
+static void set_replication_origin_to_lsn(PGconn *conn, char *origin_name, char *remote_lsn);
+static void enable_subscription(PGconn *conn, char *subscriber_name);
 static char *create_restore_point(PGconn *conn, char *restore_point_name);
-static void subscribe_to_publications(PGconn *conn, char *subscriber_name,
+static void initialize_replication_slot(PGconn *conn, char *slot_name,
+							bool drop_slot_if_exists);
+static char *subscribe_to_publications(PGconn *conn, char *subscriber_name,
 						              char *subscriber_dsn,
 					                  char *publication_names);
 
@@ -215,6 +217,7 @@ main(int argc, char **argv)
 	RemoteInfo *remote_info;
 	char	   *remote_lsn;
 	bool		stop = false;
+	bool		drop_slot_if_exists = false;
 	int			optindex;
 	char	   *subscriber_name = NULL;
 	char	   *base_sub_connstr = NULL;
@@ -224,7 +227,6 @@ main(int argc, char **argv)
 	char	   *postgresql_conf = NULL,
 			   *pg_hba_conf = NULL,
 			   *recovery_conf = NULL;
-	char	  **slot_names;
 	char       *sub_connstr;
 	char       *prov_connstr;
 	char      **database_list = { NULL };
@@ -246,8 +248,9 @@ main(int argc, char **argv)
 		{"hba-conf", required_argument, NULL, 5},
 		{"recovery-conf", required_argument, NULL, 6},
 		{"stop", no_argument, NULL, 's'},
-		{"databases", required_argument, NULL, 7},
-		{"extra-basebackup-args", required_argument, NULL, 8},
+		{"drop-slot-if-exists", no_argument, NULL, 7},
+		{"databases", required_argument, NULL, 8},
+		{"extra-basebackup-args", required_argument, NULL, 9},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -316,10 +319,13 @@ main(int argc, char **argv)
 			case 's':
 				stop = true;
 				break;
-			case 7:
-				databases = pg_strdup(optarg);
+            case 7:
+				drop_slot_if_exists = true;
 				break;
 			case 8:
+				databases = pg_strdup(optarg);
+				break;
+			case 9:
 				extra_basebackup_args = pg_strdup(optarg);
 				break;
 			default:
@@ -376,8 +382,6 @@ main(int argc, char **argv)
 		database_list[0] = dbname;
 	}
 
-	slot_names = palloc(n_databases * sizeof(char *));
-
 	/*
 	 * Check connection strings for validity before doing anything
 	 * expensive.
@@ -427,7 +431,6 @@ main(int argc, char **argv)
 		remote_info = get_remote_info(provider_conn);
 
 		/* only need to do this piece once */
-
 		if (dbnum == 0)
 		{
 			use_existing_data_dir = check_data_dir(data_dir);
@@ -437,7 +440,14 @@ main(int argc, char **argv)
 				die(_("Subscriber data directory is not basebackup of remote node.\n"));
 		}
 
-        slot_names[dbnum] = generate_random_name("replication_origin");
+		/*
+		 * Create replication slots on remote node.
+		 */
+		print_msg(VERBOSITY_NORMAL,
+				  _("Creating replication slot in database %s ...\n"), db);
+		initialize_replication_slot(provider_conn,
+									subscriber_name,
+									drop_slot_if_exists);
 
 		PQfinish(provider_conn);
 		provider_conn = NULL;
@@ -503,27 +513,6 @@ main(int argc, char **argv)
 
 	wait_primary_connection(sub_connstr);
 
-	/*
-	 * Clean any per-node data that were copied by pg_basebackup.
-	 */
-	print_msg(VERBOSITY_VERBOSE,
-			  _("Removing unwanted data ...\n"));
-
-	for (dbnum = 0; dbnum < n_databases; dbnum++)
-	{
-		char *db = database_list[dbnum];
-
-		sub_connstr = get_connstr(base_sub_connstr, db);
-
-		if (!sub_connstr || !strlen(sub_connstr))
-			die(_("Subscriber connection string is not valid.\n"));
-
-		subscriber_conn = connectdb(sub_connstr);
-		remove_unwanted_data(subscriber_conn);
-		PQfinish(subscriber_conn);
-		subscriber_conn = NULL;
-	}
-
 	/* Stop Postgres so we can reset system id and start it. */
 	pg_ctl_ret = run_pg_ctl("stop");
 	if (pg_ctl_ret != 0)
@@ -545,19 +534,12 @@ main(int argc, char **argv)
 	for (dbnum = 0; dbnum < n_databases; dbnum++)
 	{
 		char *db = database_list[dbnum];
+        char *origin_name;
 
 		sub_connstr = get_connstr(base_sub_connstr, db);
 		prov_connstr = get_connstr(base_prov_connstr, db);
 
 		subscriber_conn = connectdb(sub_connstr);
-
-		/*
-		 * Create the identifier which is setup with the position to which we
-		 * already caught up using physical replication.
-		 */
-		print_msg(VERBOSITY_VERBOSE,
-				  _("Creating replication origin for database %s...\n"), db);
-		initialize_replication_origin(subscriber_conn, slot_names[dbnum], remote_lsn);
 
 		/*
 		 * And finally add the node to the cluster.
@@ -566,8 +548,21 @@ main(int argc, char **argv)
 				  subscriber_name, db);
 		print_msg(VERBOSITY_VERBOSE, _("Replication sets: %s\n"), publication_names);
 
-		subscribe_to_publications(subscriber_conn, subscriber_name, prov_connstr,
+		origin_name = subscribe_to_publications(
+                            subscriber_conn, subscriber_name, prov_connstr,
 							publication_names);
+
+		/*
+		 * Create the identifier which is setup with the position to which we
+		 * already caught up using physical replication.
+		 */
+		print_msg(VERBOSITY_VERBOSE,
+				  _("Set replication origin for database %s to LSN %s...\n"), db, remote_lsn);
+		set_replication_origin_to_lsn(subscriber_conn, origin_name, remote_lsn);
+
+		print_msg(VERBOSITY_VERBOSE,
+				  _("Enabling subscription %s ...\n"), subscriber_name);
+        enable_subscription(subscriber_conn, subscriber_name);
 
 		PQfinish(subscriber_conn);
 		subscriber_conn = NULL;
@@ -588,7 +583,6 @@ main(int argc, char **argv)
 	return 0;
 }
 
-
 /*
  * Print help.
  */
@@ -608,6 +602,7 @@ usage(void)
 	printf(_("  --subscriber-dsn=CONNSTR          connection string to the newly created subscriber\n"));
 	printf(_("  --provider-dsn=CONNSTR            connection string to the provider\n"));
 	printf(_("  --publication-names=PUBLICATIONS  comma separated list of publication names\n"));
+	printf(_("  --drop-slot-if-exists             drop replication slot of conflicting name\n"));
 	printf(_("  -s, --stop                        stop the server once the initialization is done\n"));
 	printf(_("  -v                                increase logging verbosity\n"));
 	printf(_("  --extra-basebackup-args           additional arguments to pass to pg_basebackup.\n"));
@@ -661,7 +656,6 @@ print_msg(VerbosityLevelEnum level, const char *fmt,...)
 	}
 }
 
-
 /*
  * Start pg_ctl with given argument(s) - used to start/stop postgres
  *
@@ -675,7 +669,7 @@ run_pg_ctl(const char *arg)
 	PQExpBuffer  cmd = createPQExpBuffer();
 	char		*exec_path = find_other_exec_or_die(argv0, "pg_ctl");
 
-	appendPQExpBuffer(cmd, "%s %s -D \"%s\" -s", exec_path, arg, data_dir);
+	appendPQExpBuffer(cmd, "%s %s -D \"%s\"", exec_path, arg, data_dir);
 
 	/* Run pg_ctl in silent mode unless we run in debug mode. */
 	if (verbosity < VERBOSITY_DEBUG)
@@ -695,7 +689,6 @@ run_pg_ctl(const char *arg)
 
 	return -1;
 }
-
 
 /*
  * Run pg_basebackup to create the copy of the origin node.
@@ -793,6 +786,65 @@ check_data_dir(char *data_dir)
 }
 
 /*
+ * Initialize replication slots
+ */
+static void
+initialize_replication_slot(PGconn *conn, char *slot_name,
+							bool drop_slot_if_exists)
+{
+	PQExpBuffer query = createPQExpBuffer();
+	PGresult    *res;
+
+	/* Check if the current slot exists. */
+	printfPQExpBuffer(query,
+					  "SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = %s",
+					  PQescapeLiteral(conn, slot_name, strlen(slot_name)));
+
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		die(_("Could not fetch existing slot information: %s"), PQerrorMessage(conn));
+
+	/* Drop the existing slot when asked for it or error if it already exists. */
+	if (PQntuples(res) > 0)
+	{
+		PQclear(res);
+
+		if (!drop_slot_if_exists)
+			die(_("Slot %s already exists, drop it or use --drop-slot-if-exists to drop it automatically.\n"),
+				slot_name);
+
+		print_msg(VERBOSITY_VERBOSE,
+				  _("Droping existing slot %s ...\n"), slot_name);
+
+		printfPQExpBuffer(query,
+						  "SELECT pg_catalog.pg_drop_replication_slot(%s)",
+						  PQescapeLiteral(conn, slot_name, strlen(slot_name)));
+
+		res = PQexec(conn, query->data);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			die(_("Could not drop existing slot %s: %s"), slot_name,
+				PQerrorMessage(conn));
+	}
+
+	PQclear(res);
+
+	/* And finally, create the slot. */
+	printfPQExpBuffer(query, "SELECT pg_create_logical_replication_slot(%s, '%s');",
+					  PQescapeLiteral(conn, slot_name, strlen(slot_name)),
+					  "pgoutput");
+
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		die(_("Could not create replication slot, status %s: %s\n"),
+			 PQresStatus(PQresultStatus(res)), PQresultErrorMessage(res));
+	}
+
+	PQclear(res);
+    destroyPQExpBuffer(query);
+}
+
+/*
  * Read replication info about remote connection
  *
  */
@@ -814,44 +866,13 @@ get_remote_info(PGconn* conn)
 }
 
 /*
- * Clean all the data that was copied from remote node but we don't
- * want it here (currently shared security labels and replication identifiers).
- */
-static void
-remove_unwanted_data(PGconn *conn)
-{
-	PGresult	*res;
-
-	res = PQexec(conn, "SELECT pg_replication_origin_drop(external_id) FROM pg_replication_origin_status;");
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		PQclear(res);
-		die(_("Could not remove existing replication origins: %s\n"), PQerrorMessage(conn));
-	}
-	PQclear(res);
-}
-
-/*
  * Initialize new remote identifier to specific position.
  */
 static void
-initialize_replication_origin(PGconn *conn, char *origin_name, char *remote_lsn)
+set_replication_origin_to_lsn(PGconn *conn, char *origin_name, char *remote_lsn)
 {
 	PGresult   *res;
 	PQExpBuffer query = createPQExpBuffer();
-
-	printfPQExpBuffer(query, "SELECT pg_replication_origin_create(%s)",
-					  PQescapeLiteral(conn, origin_name, strlen(origin_name)));
-
-	res = PQexec(conn, query->data);
-
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		die(_("Could not create replication origin \"%s\": status %s: %s\n"),
-			query->data,
-			PQresStatus(PQresultStatus(res)), PQresultErrorMessage(res));
-	}
-	PQclear(res);
 
 	if (remote_lsn)
 	{
@@ -872,7 +893,6 @@ initialize_replication_origin(PGconn *conn, char *origin_name, char *remote_lsn)
 	
 	destroyPQExpBuffer(query);
 }
-
 
 /*
  * Create remote restore point which will be used to get into synchronized
@@ -900,20 +920,20 @@ create_restore_point(PGconn *conn, char *restore_point_name)
 	return remote_lsn;
 }
 
-static void
+static char *
 subscribe_to_publications(PGconn *conn, char *subscriber_name, char *subscriber_dsn,
 				          char *publication_names)
 {
-	PQExpBufferData		query;
-	PGresult		   *res;
+	PQExpBuffer query = createPQExpBuffer();
+	PGresult    *res;
+    char        *origin_name;
 
-	initPQExpBuffer(&query);
-	printfPQExpBuffer(&query,
-					  "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = false);",
+	printfPQExpBuffer(query,
+					  "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = false, create_slot = false, enabled = false);",
 					  subscriber_name, PQescapeLiteral(conn, subscriber_dsn, strlen(subscriber_dsn)),
                       publication_names);
 
-	res = PQexec(conn, query.data);
+	res = PQexec(conn, query->data);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		die(_("Could not create subscription, status %s: %s\n"),
@@ -921,9 +941,42 @@ subscribe_to_publications(PGconn *conn, char *subscriber_name, char *subscriber_
 	}
 	PQclear(res);
 
-	termPQExpBuffer(&query);
+    printfPQExpBuffer(query,
+                      "SELECT 'pg_'||oid FROM pg_subscription WHERE subname = %s",
+                      PQescapeLiteral(conn, subscriber_name, strlen(subscriber_name)));
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		die(_("Could not get replication origin name, status %s: %s\n"),
+			 PQresStatus(PQresultStatus(res)), PQresultErrorMessage(res));
+    }
+    origin_name = pstrdup(PQgetvalue(res, 0, 0));
+    PQclear(res);
+
+	destroyPQExpBuffer(query);
+
+    return origin_name;
 }
 
+static void
+enable_subscription(PGconn *conn, char *subscriber_name)
+{
+	PQExpBuffer query = createPQExpBuffer();
+	PGresult    *res;
+
+	printfPQExpBuffer(query, "ALTER SUBSCRIPTION %s ENABLE;", subscriber_name);
+
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		die(_("Could enable subscription %s, status %s: %s\n"),
+             subscriber_name,
+			 PQresStatus(PQresultStatus(res)), PQresultErrorMessage(res));
+	}
+	PQclear(res);
+
+	destroyPQExpBuffer(query);
+}
 
 /*
  * Validates input of the replication sets and returns normalized data.
@@ -1004,7 +1057,6 @@ get_connstr_dbname(char *connstr)
 
 	return ret;
 }
-
 
 /*
  * Build connection string from individual parameter.
@@ -1093,7 +1145,6 @@ get_connstr(char *connstr, char *dbname)
 	return ret;
 }
 
-
 /*
  * Reads the pg_control file of the existing data dir.
  */
@@ -1181,7 +1232,6 @@ CopyConfFile(char *fromfile, char *tofile, bool append)
 	copy_file(fromfile, filename, append);
 }
 
-
 /*
  * Convert PQconninfoOption array into conninfo string
  */
@@ -1248,7 +1298,6 @@ appendPQExpBufferConnstrValue(PQExpBuffer buf, const char *str)
 		appendPQExpBufferStr(buf, str);
 }
 
-
 /*
  * Find the pgport and try a connection
  */
@@ -1295,7 +1344,6 @@ wait_postmaster_connection(const char *connstr)
 
 	print_msg(VERBOSITY_VERBOSE, "\n");
 }
-
 
 /*
  * Wait for PostgreSQL to leave recovery/standby mode
@@ -1446,7 +1494,6 @@ copy_file(char *fromfile, char *tofile, bool append)
 
 	free(buffer);
 }
-
 
 static char *
 find_other_exec_or_die(const char *argv0, const char *target)
