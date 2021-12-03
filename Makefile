@@ -11,8 +11,6 @@ PGVER := $(shell $(PG_CONFIG) --version | sed 's/[^0-9]//g' | cut -c 1-2)
 PG_CPPFLAGS += -I$(libpq_srcdir) -Werror=implicit-function-declaration
 SHLIB_LINK += $(libpq)
 
-OBJS += $(srcdir)/compat$(PGVER)/pg_compat.o
-
 PGXS = $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
